@@ -1,0 +1,1214 @@
+/*
+QuadTree N BODY
+
+QuadTree Encoding
+Thrust Sort
+Compute Center of Mass
+NBody
+	Body Interactions for region
+	Body Interactions for neighbouring regions
+	Far-field approximations using center of mass
+
+Possible Improvements
+	Tiling using Shared Memory
+	Use constant memory for LUT
+*/
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <cmath>
+#include <thrust/sort.h>
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#include <iostream>
+
+#include <algorithm>
+#include <vector>
+#include <numeric>
+#define _USE_MATH_DEFINES
+#include "math.h"
+
+#ifdef _WIN32
+#include<windows.h>
+#endif
+#include <GL/glew.h>
+#include <GL/wglew.h>
+#include <GL/glut.h>
+
+const int N = 8192;
+const int n = 3;
+int ThreadsQ = 128;
+int ThreadsX = 128;
+int ThreadsC = 32; // blocksize for compute com
+const int iterations = 100;
+const double sim_rad = 1e18;
+
+std::vector<float> results;
+std::vector<float> vresults;
+std::vector<float> sresults;
+std::vector<float> cresults;
+
+struct Quad
+{
+	double2 center;
+	double w;
+	__device__ Quad(double2 _c, double _w)
+	{
+		center = _c;
+		w = _w;
+	}
+	void print()
+	{
+		std::cout << "x: " << center.x << " y: " << center.y << " w: " << w << std::endl;
+	}
+};
+
+double4* M_cd;
+int* LUT_d;
+int2* index_d;
+
+// Description of Body
+struct body
+{
+	float4 colour;
+	double4 position;
+	double4 velocity;
+	int morton;
+	double2 force;
+	bool operator==(body b)
+	{
+		return( (position.x == b.position.x) && (position.y == b.position.y) && (velocity.x == b.velocity.x) && (velocity.y == b.velocity.y) );
+	}
+	void print()
+	{
+		std::cout << "\tMorton : " << morton;
+		std::cout << "\n\tPosition(x,y): " << position.x << " " << position.y;
+		std::cout << "\n\tV: " << velocity.x << " " << velocity.y;
+		std::cout << "\tF: " << velocity.z << " " << velocity.w;
+		std::cout << "\n\tMass: " << position.w << std::endl << std::endl;
+	}
+};
+
+// sort Morton
+__host__ __device__ bool operator<(const body &lhs, const body &rhs) 
+{
+	return lhs.morton < rhs.morton;
+}
+
+double circlev(double x, double y)
+{
+	double solarmass = 1.98892e30;
+	double r2 = sqrt(x*x + y*y);
+	double numerator = (6.67e-11)*1e6*solarmass;
+	return sqrt(numerator/r2);
+}
+double random()			{ return ((double)rand())/((double)RAND_MAX); }
+template <typename T> int signum(T val) {
+    return (T(0) < val) - (val < T(0));
+}
+body init_body(int i)
+{
+	double solarmass = 1.98892e30;
+	if(i != 0)
+	{
+		double px = sim_rad*exp(-1.8)*(0.5 - random());
+		double py = sim_rad*exp(-1.8)*(0.5 - random());
+		double magv = circlev(px, py);
+
+		double absangle = atan(abs(py/px));
+		double thetav = M_PI/2 - absangle;
+		double phiv = random() * M_PI;
+		double vx = -1*signum(py)*cos(thetav)*magv;
+		double vy = signum(px)*sin(thetav)*magv;
+
+		if(random() < 0.5)
+		{
+			vx = -vx;
+			vy = -vy;
+		}
+
+		double mass = random() * solarmass*10+1e20;
+
+		body b;
+		b.position.x = px;
+		b.position.y = py;
+		b.position.z = 0;
+		b.position.w = mass;
+
+		b.velocity.x = vx;
+		b.velocity.y = vy;
+		b.velocity.z = 0;
+		b.velocity.w = 0;
+
+		b.colour.x = 1.0f;
+		b.colour.y = 0.0f;
+		b.colour.z = 0.0f;
+		b.colour.w = 1.0f;
+
+		b.morton = 0;
+		return b;
+	}
+	else
+	{
+		body b;
+		b.position.x = 0;
+		b.position.y = 0;
+		b.position.z = 0;
+		b.position.w = 1e6*solarmass;
+
+		b.velocity.x = 0;
+		b.velocity.y = 0;
+		b.velocity.z = 0;
+		b.velocity.w = 0;
+
+		b.colour.x = 1.0f;
+		b.colour.y = 1.0f;
+		b.colour.z = 0.0f;
+		b.colour.w = 1.0f;
+
+		b.morton = 0;
+		return b;
+	}
+}
+
+	body* b_in;
+	body* b_out;
+
+void cudaQuery();
+
+__device__ double2 bodyBodyInteraction(double4 bi, double4 bj, double2 a, bool output_thread)
+{
+    double G = 6.67e-11;   // gravational constant
+    double EPS = 3E4;      // softening parameter
+
+	// [2 FLOPS] 
+	double dx = bj.x - bi.x;
+	double dy = bj.y - bi.y;
+
+	// [5 FLOPS]
+	double dist = sqrt(dx*dx + dy*dy) + 0.0000125; // additional softening parameter
+	
+	// [6 FLOPS]
+	double F = (G * bi.w * bj.w) / (dist*dist + EPS*EPS);
+
+	// [6 FLOPS]
+	a.x += F * dx / dist;
+	a.y += F * dy / dist;
+
+	return a;
+}
+
+__device__ int findFirstValue(body* body_in, int h)
+{
+	int left = -1;
+	int right = N-1;
+
+	while(right > left + 1)
+	{
+		int middle = (left + right)/2;
+		if(body_in[middle].morton >= h)
+			right = middle;
+		else
+			left = middle;
+	}
+
+	if(right < N-1 && body_in[right].morton == h)
+		return right;
+
+	return -1;
+}
+
+__global__ void
+compute_center_mass_with_search(body* body_in, double4* c_m, int2* index_store, int lim)
+{
+    //	idx( 0 to uNumVoronoiPts )
+	unsigned int idx = blockIdx.x*blockDim.x + threadIdx.x;
+
+	if(idx > lim -1 )
+		return;
+
+	bool mass = 0;
+	double4 center;
+	center.x = 0.0;
+	center.y = 0.0;
+	center.z = 0.0;
+	center.w = 0.0;
+
+	int first = 0;
+	int last = 0;
+
+	int start = findFirstValue(body_in, idx);
+	
+	if(start != -1)
+	{
+		// for all bodies
+		for(int b = start; b < N; b++)
+		{
+			int hil = body_in[b].morton;
+			if(idx == hil)
+			{
+				// if first hilbert in list
+				if(!mass)
+				{
+					center = body_in[b].position;	//assign initial value
+					first = b;
+					mass = true;
+				}
+				else
+				{
+					double4 other = body_in[b].position;
+					center.x = center.x*center.w + other.x * other.w;
+					center.y = center.y*center.w + other.y * other.w;
+					//center.z = center.z*center.w + other.z * other.w;
+					center.w += other.w;
+					center.x = center.x/center.w;
+					center.y = center.y/center.w;
+					//center.z = center.z/center.w;				
+				}
+			}
+			if(hil > idx)
+			{
+				first = (mass == 0) ? b : first;
+				//if((!mass))
+				//	first = b;
+	
+				last = b;
+				break;
+			}
+		}
+	}
+
+	last = ((last == 0) && (first != 0)) ? N-1 : last;
+	//if((last == 0) && (first != 0))
+	//	last = N-1;
+
+	//center of mass for voronoi region
+	index_store[idx].x = first;
+	index_store[idx].y = last;
+	c_m[idx] = center;
+}
+
+__device__ double2 computeHilbertBodies(int h, int2* index_store, body* body_in, double4 position, double2 force)
+{
+	for(int i = index_store[h].x; i < index_store[h].y; i++)
+	{
+		force = bodyBodyInteraction(position, body_in[i].position, force, false);
+	}
+
+	return force;
+}
+
+__device__ int2 findValue(int* LUT, int h)
+{
+	int DIM = 1 << n;
+
+	for(int y = 0; y < DIM; y++)
+	{
+		for(int x = 0; x < DIM; x++)
+		{
+			if(LUT[y*DIM + x] == h)
+			{
+				int2 coords;
+				coords.x = x;
+				coords.y = y;
+				return coords;
+			}
+		}
+	}
+
+	int2 err;
+	err.x = -1;
+	err.y = -1;
+	return err;
+}
+
+
+__global__ void 
+nbody_kernel_hil(body* body_in, double4* c_m, int* LUT, int2* index_store, body* body_out)
+{
+    unsigned int idx = blockIdx.x*blockDim.x + threadIdx.x;
+
+	double4 position = body_in[idx].position;
+	//int morton = body_in[idx].morton;
+	int DIM = 1 << n;
+
+	// Indentify the regions neighbouring body[idx]
+	int2 coords = findValue(LUT, body_in[idx].morton);
+	int regions[9];
+
+	// 9 reads from global memory.........
+					//y*width + x
+	// in window
+	// !on edge
+	//(coords.y-1 + DIM)
+	regions[0] = LUT[(coords.y-1 + DIM)%DIM*DIM + (coords.x-1 + DIM)%DIM];
+	regions[1] = LUT[(coords.y-1 + DIM)%DIM*DIM + (coords.x + DIM)%DIM];
+	regions[2] = LUT[(coords.y-1 + DIM)%DIM*DIM + (coords.x+1 + DIM)%DIM];
+		   
+	regions[3] = LUT[(coords.y + DIM)%DIM*DIM + (coords.x-1 + DIM)%DIM];
+	regions[4] = LUT[(coords.y + DIM)%DIM*DIM + (coords.x + DIM)%DIM];
+	regions[5] = LUT[(coords.y + DIM)%DIM*DIM + (coords.x+1 + DIM)%DIM];
+		   
+	regions[6] = LUT[(coords.y+1 + DIM)%DIM*DIM + (coords.x-1 + DIM)%DIM];
+	regions[7] = LUT[(coords.y+1 + DIM)%DIM*DIM + (coords.x + DIM)%DIM];
+	regions[8] = LUT[(coords.y+1 + DIM)%DIM*DIM + (coords.x+1 + DIM)%DIM];
+
+	// calculate force contributions for body
+	double2 force;
+	force.x = 0.0;
+	force.y = 0.0;
+
+	// for bodies in same region do body body interaction
+	//double2 f;
+	//f.x = 0.0;
+	//f.y = 0.0;
+	for(int i = 0; i < 9; i++)
+	{
+		force = computeHilbertBodies(regions[i], index_store, body_in, position, force); 
+		//f = bodyBodyInteraction(position, c_m[regions[i]], f, false); 
+	}
+	
+	//force = computeHilbertBodies(morton, index_store, body_in, position, force); 
+	
+
+	// subtract the centerofmass influence to cancel when added to force
+	//force.x = force.x - f.x;
+	//force.y = force.y - f.y;
+
+	// else use the center of mass from LUT
+	// except the center of current hilbert
+	//for(int i = 0; i < DIM*DIM; i++)
+	//{
+		//if(i != morton)
+		//{
+		//double4 p_j = c_m[i];
+		//force = bodyBodyInteraction(position, p_j, force, false);
+		//}
+	//}
+
+	// Do update
+	double4 velocity = body_in[idx].velocity;
+	double2 v;
+	v.x = velocity.x + 1e10 * force.x / position.w;
+	v.y = velocity.y + 1e10 * force.y / position.w;
+
+	body_out[idx].velocity.x = v.x;
+	body_out[idx].velocity.y = v.y;
+	//body_out[idx].velocity.z = force.x;
+	//body_out[idx].velocity.w = force.y;
+
+	body_out[idx].position.x = position.x + 1e10 * v.x;
+	body_out[idx].position.y = position.y + 1e10 * v.y;
+	//body_out[idx].position.z = 0;
+	body_out[idx].position.w = position.w;
+	body_out[idx].colour = body_in[idx].colour;
+	body_out[idx].morton = body_in[idx].morton;
+}
+
+__device__ int getQuadID(double2 p, Quad& q)
+{
+	int ID = -1;
+	double2 c;
+	if(p.x < q.center.x)	// 0 or 2
+	{
+		if(p.y < q.center.y)
+		{		
+			c.x = q.center.x - 0.25*q.w;
+			c.y = q.center.y - 0.25*q.w;
+			ID = 2;
+		}
+		else
+		{
+			c.x = q.center.x - 0.25*q.w;
+			c.y = q.center.y + 0.25*q.w;
+			ID = 0;
+		}
+	}
+	else			// 1 or 3
+	{
+		if(p.y < q.center.y)
+		{
+			c.x = q.center.x + 0.25*q.w;
+			c.y = q.center.y - 0.25*q.w;
+			ID = 3;
+		}
+		else
+		{
+			c.x = q.center.x + 0.25*q.w;
+			c.y = q.center.y + 0.25*q.w;
+			ID = 1;
+		}
+	}
+
+	// update quad
+	q = Quad( c, 0.5*q.w );	
+	return ID;
+}
+
+__device__ int toDec(int* r, int b)
+{
+	int decimal = 0;
+	int mult = 1;
+    for(int i = 0; i < n; i++)
+    {
+        decimal += r[n-1-i]*mult;
+		mult *= b;
+
+    }
+
+	return decimal;
+}
+
+// Create Voronoi kernel
+__global__ void create_quadtree( body* body_in, double radius)
+{
+    // map from thread to pixel position
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	// read body position
+	double2 position;
+	position.x = body_in[idx].position.x;
+	position.y = body_in[idx].position.y;
+
+	// initial quad
+	double2 c;
+	c.x = 0.0;
+	c.y = 0.0;
+	Quad q( c, radius*2 );
+
+	// generate code for zone
+	int word = 0;
+	int mult = 1 <<2*(n-1);	//4^(n-1)
+	for(int i = 0; i < n; i++)
+	{
+		int ID = getQuadID( position, q );
+		word += ID*mult;
+		mult = mult >> 2; // divide by 4
+	}
+
+	// now save the generated code for that position
+	body_in[idx].morton = word;
+}
+
+__global__ void create_quadtree_mw( body* body_in, double radius)
+{
+    // map from thread to buffer position
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	for(int i = 0; i < 4; i++)
+	{
+		int x = idx + i*N/4;
+
+		// read body position
+		double2 position;
+		position.x = body_in[x].position.x;
+		position.y = body_in[x].position.y;
+
+		// initial quad
+		double2 c;
+		c.x = 0.0;
+		c.y = 0.0;
+		Quad q( c, radius*2 );
+
+		// generate code for zone
+		int word = 0;
+		int mult = pow(4.0, n-1);
+		for(int i = 0; i < n; i++)
+		{
+			int ID = getQuadID( position, q );
+			word += ID*mult;
+			mult /= 4;
+		}
+
+		// now save the generated code for that position
+		body_in[x].morton = word;
+	}
+}
+
+bool cudaCheckAPIError(cudaError_t err)
+{
+	if(err != cudaSuccess)
+	{
+		std::cerr << "Error : " << cudaGetErrorString(err) << std::endl;
+		system("pause");
+		return false;
+	}
+
+	return true;
+}
+
+template <class T>
+void printLine(const char* message, T value)
+{
+	std::cout << message << "\t : " << value << std::endl;
+}
+template <class T>
+void printLine(const char* message, T* value)
+{
+	if(value[2] == NULL)
+		std::cout << message << "\t : " << value[0] << ", " << value[1] << std::endl;
+	else
+		std::cout << message << "\t : " << value[0] << " " << value[1] << " " << value[2] << std::endl;
+}
+
+void printBlank()
+{
+	std::cout << std::endl;
+}
+
+size_t RoundUp(int groupSize, int globalSize)
+{
+    int r = globalSize % groupSize;
+    if(r == 0)
+    {
+        return globalSize;
+    }
+    else
+    {
+        return globalSize + groupSize - r;
+    }
+}
+
+void cleanup()
+{
+	//cleanup
+	cudaCheckAPIError( cudaFree( b_in ) );
+	cudaCheckAPIError( cudaFree( b_out ) );
+	cudaCheckAPIError( cudaFree( M_cd) );
+	cudaCheckAPIError( cudaFree( LUT_d ) );
+
+	exit(EXIT_SUCCESS);
+}
+
+void Key(unsigned char key, int x, int y)
+{
+    switch(key) 
+    {
+        case '\033': // escape quits
+        case '\015': // Enter quits    
+        case 'Q':    // Q quits
+        case 'q':    // q (or escape) quits
+            // Cleanup up and quit
+                cleanup();
+            break;
+		case 'p':
+			system("pause");
+			break;
+    }
+}
+
+float completeEvent(cudaEvent_t start, cudaEvent_t stop)
+{
+	// Add the stop event to the GPUs queue of work
+	cudaCheckAPIError( cudaEventRecord(stop, 0) );
+	
+	// Wait until the event has completed so it is safe to read
+	cudaCheckAPIError( cudaEventSynchronize(stop) );
+	
+	// Determine the time elapsed between the events
+	float milliseconds = 0;
+	cudaCheckAPIError( cudaEventElapsedTime(&milliseconds, start, stop) );
+
+	return milliseconds;
+}
+
+void renderBodies(body* b)
+{
+	body bodies[N];
+
+	// copy data from device to host
+	//cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		cudaCheckAPIError( cudaMemcpy( bodies, b, sizeof(body)*N, cudaMemcpyDeviceToHost ) );
+	//completeEvent(startEvent, stopEvent, "retrieving output", false);
+
+	//for(int i = 0; i < N; i++)
+	//	bodies[i].print();
+
+    glEnable( GL_POINT_SMOOTH );
+    glEnable( GL_BLEND );
+    glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+    glPointSize( 2.0 );
+
+	glClearColor( 0.0, 0.0, 1.0, 1.0 );
+	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	//glColor3f(1, 0, 0);
+
+	glBegin(GL_POINTS);
+		for(int i = 0; i < N; i++)
+		{
+			glColor3f( bodies[i].colour.x, bodies[i].colour.y, bodies[i].colour.z );	
+			glVertex2f(bodies[i].position.x/(sim_rad/4), bodies[i].position.y/(sim_rad/4));
+		}
+	glEnd();
+
+	glFinish();
+	glutSwapBuffers();
+
+	//for(int i = 0; i < N; i++)
+	//	bodies[i].print();
+
+	//system("pause");
+}
+
+void outputCOM()
+{
+	int num = 1<<2*n;
+	double4* com = new double4[num];
+	int2* index_store = new int2[num];
+
+	// copy data from device to host
+	cudaCheckAPIError( cudaMemcpy( com, M_cd, sizeof(double4)*num, cudaMemcpyDeviceToHost ) );
+	cudaCheckAPIError( cudaMemcpy( index_store, index_d, sizeof(int2)*num, cudaMemcpyDeviceToHost ) );
+
+	for(int i = 0; i < num; i++)
+	{
+		if(com[i].w != 0.0)
+		{
+			std::cout <<"H" << i << "\tX: " << com[i].x << " Y: " << com[i].y << " M: " << com[i].w << std::endl;
+			std::cout <<"\tFirst" << index_store[i].x << " Last: " << index_store[i].y << std::endl;
+		}
+	}
+
+	delete [] com;
+	delete [] index_store;
+}
+
+// Execute voronoi kernel
+void executeQuadTree()
+{
+	// Event parameters 
+	cudaEvent_t startEvent, stopEvent;
+
+	// Create the event using cudaEventCreate
+	cudaCheckAPIError( cudaEventCreate(&startEvent) );
+	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
+
+	int gridSize = N/(ThreadsQ);
+	if(gridSize < 1)
+		gridSize = 1;
+
+	dim3 grid( gridSize );
+	dim3 block( ThreadsQ );
+
+	cudaFuncSetCacheConfig(create_quadtree, cudaFuncCachePreferL1);
+
+	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		create_quadtree <<< grid, block >>> (b_in, sim_rad/8);
+	vresults.push_back( completeEvent(startEvent, stopEvent) );
+
+	// Release events
+	cudaCheckAPIError( cudaEventDestroy(startEvent) );
+	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
+}
+
+// compute center of mass
+void computeCOM()
+{
+	// Event parameters 
+	cudaEvent_t startEvent, stopEvent;
+
+	// Create the event using cudaEventCreate
+	cudaCheckAPIError( cudaEventCreate(&startEvent) );
+	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
+
+	int totalSize = 1<<2*n;
+	int gridSize = totalSize/ThreadsC;
+	if (gridSize < 1)
+		gridSize = 1;
+
+	dim3 grid( gridSize );
+	dim3 block( ThreadsC );
+
+	cudaFuncSetCacheConfig(compute_center_mass_with_search, cudaFuncCachePreferL1);
+
+	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		compute_center_mass_with_search <<< grid, block >>> (b_out, M_cd, index_d, totalSize);
+	cresults.push_back( completeEvent(startEvent, stopEvent) );
+
+	// Release events
+	cudaCheckAPIError( cudaEventDestroy(startEvent) );
+	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
+}
+
+void nBodyHil()
+{
+	// Event parameters 
+	cudaEvent_t startEvent, stopEvent;
+
+	// Create the event using cudaEventCreate
+	cudaCheckAPIError( cudaEventCreate(&startEvent) );
+	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
+
+	int gridSize = N/ThreadsX;
+	if(gridSize < 1)
+		gridSize = 1;
+	dim3 grid( gridSize );
+	dim3 block(ThreadsX);
+
+	cudaFuncSetCacheConfig(nbody_kernel_hil, cudaFuncCachePreferL1);
+
+	// compute body updates
+	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		nbody_kernel_hil <<< grid, block >>> (b_out, M_cd, LUT_d, index_d, b_in);
+	results.push_back( completeEvent(startEvent, stopEvent) );
+
+	// Release events
+	cudaCheckAPIError( cudaEventDestroy(startEvent) );
+	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
+}
+
+void outputStats(std::vector<float>& results)
+{
+	// Median	
+	std::sort( results.begin(), results.end());
+	double med = 0.0;
+	if(results.size()/2 == 0)
+		med = results[ results.size()/2 ];
+	else
+	{
+		med = (results[ results.size()/2 ] + results[ results.size()/2 - 1])/2.0; 
+	}
+	printf("Median: %.2f ms\n", med);
+
+	results.clear();
+}
+
+void sortBodies()
+{
+	// copy bodies from device memory into thrust device vector
+	// first copy device to host,
+	// fill in host vector with host buffer
+	// copy from host to device vector
+	// perform sort
+	// copy device to host
+	// update host buffer
+	// copy to device memory
+	// put this is render, then we have 1 less copy to host
+	thrust::device_vector<body> b;
+	thrust::host_vector<body> output;
+
+	body bodies[N];
+
+	// copy data from device to host
+	//cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		cudaCheckAPIError( cudaMemcpy( bodies, b_in, sizeof(body)*N, cudaMemcpyDeviceToHost ) );
+
+	for(int i = 0; i < N; i++)
+	{
+		output.push_back(bodies[i]);
+		//bodies[i].print();
+	}
+
+	// Event parameters 
+	cudaEvent_t startEvent, stopEvent;
+
+	// Create the event using cudaEventCreate
+	cudaCheckAPIError( cudaEventCreate(&startEvent) );
+	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
+
+	b = output;
+
+	// compute body updates
+	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		thrust::sort(b.begin(), b.end());
+	sresults.push_back( completeEvent(startEvent, stopEvent) );
+
+	// Release events
+	cudaCheckAPIError( cudaEventDestroy(startEvent) );
+	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
+
+	// cast thrust vector to raw pointer -- b needs to be global/error on close
+	//b_in = thrust::raw_pointer_cast(b.data());
+
+	output = b;
+	
+	for(int i= 0; i < N; i++)
+	{
+		bodies[i] = output[i];
+	}
+
+	cudaCheckAPIError( cudaMemcpy( b_out, bodies, sizeof(body)*N, cudaMemcpyHostToDevice) );
+
+}
+
+void sortRender(body* b_draw)
+{
+	body bodies[N];
+	thrust::device_vector<body> b;
+	thrust::host_vector<body> output;
+
+	// read from device memory to host buffer
+	cudaCheckAPIError( cudaMemcpy( bodies, b_draw, sizeof(body)*N, cudaMemcpyDeviceToHost ) );
+
+	// set up drawing
+    glEnable( GL_POINT_SMOOTH );
+    glEnable( GL_BLEND );
+    glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+    glPointSize( 9.0 );
+
+	glClearColor( 0.0, 0.0, 1.0, 1.0 );
+	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	// for all points - draw and copy into host vector
+	glBegin(GL_POINTS);
+		for(int i = 0; i < N; i++)
+		{
+			glColor3f( bodies[i].colour.x, bodies[i].colour.y, bodies[i].colour.z );	
+			glVertex2f(bodies[i].position.x/(sim_rad/8), bodies[i].position.y/(sim_rad/8));
+			output.push_back(bodies[i]);
+		}
+	glEnd();
+
+	// finish drawing
+	glFinish();
+	glutSwapBuffers();
+
+	// Event parameters 
+	cudaEvent_t startEvent, stopEvent;
+
+	// Create the event using cudaEventCreate
+	cudaCheckAPIError( cudaEventCreate(&startEvent) );
+	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
+
+	// copy from host to device vector
+	b = output;
+
+	// sort using thrust on morton code
+	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
+		thrust::sort(b.begin(), b.end());
+	sresults.push_back( completeEvent(startEvent, stopEvent) );
+
+	// Release events
+	cudaCheckAPIError( cudaEventDestroy(startEvent) );
+	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
+
+	// copy device to host vector
+	output = b;
+	
+	// copy host vector to host memory
+	for(int i= 0; i < N; i++)
+	{
+		bodies[i] = output[i];
+		bodies[i].print();
+	}
+	printf("\n");
+
+	//system("pause");
+	// copy host memory to device memory
+	cudaCheckAPIError( cudaMemcpy( b_in, bodies, sizeof(body)*N, cudaMemcpyHostToDevice) );
+}
+
+void outputBodies(body* b)
+{
+	body bodies[N];
+
+	// copy data from device to host
+	cudaCheckAPIError( cudaMemcpy( bodies, b, sizeof(body)*N, cudaMemcpyDeviceToHost ) );
+
+	for(int i = 0; i < N; i++)
+	{
+		//output.push_back(bodies[i]);
+		bodies[i].print();
+	}
+
+}
+
+void Draw()
+{	
+	//printf("quad encoding..\n");
+	executeQuadTree();
+	//outputBodies(b_out);
+	//system("pause");
+
+	//printf("sorting..\n");
+	sortBodies();	
+	//outputBodies(b_in);
+	//system("pause");
+	
+	// compute center of mass requires sorted order
+	//printf("computing com..\n");
+	computeCOM();
+	//outputCOM();
+	//system("pause");
+
+	//printf("performing interactions..\n");
+	nBodyHil();
+	//outputBodies(b_out);
+	//system("pause");
+
+	//printf("drawing bodies..\n");
+	renderBodies(b_out);
+
+	//std::swap(b_in, b_out);
+/*
+	static int i = 0;
+	i++;
+	if(i > iterations)
+	{
+		i = 0;
+		
+		// Output Interaction Results
+		printf("\nVoronoi NBody Results\n");
+		printf("Threads -\t%d\n", ThreadsX);
+		printf("Voronoi -\t");
+		outputStats(vresults);
+		printf("Sort -\t");
+		outputStats(sresults);
+		printf("CoM -\t");
+		outputStats(cresults);
+		printf("NBody -\t");
+		outputStats(results);
+
+		//ThreadsX *= 2;
+
+		system("pause");
+		cleanup();
+	}
+
+	if((ThreadsX > N) || (ThreadsX > 1024))
+	{
+		system("pause");
+		cleanup();
+	}
+*/
+}
+
+void initGL(int argc, char *argv[], int wWidth, int wHeight)
+{
+	// init gl
+	glutInit( &argc, argv );
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowPosition(500, 100);
+	glutInitWindowSize( wWidth, wHeight );
+	glutCreateWindow( "CUDA Nbody" );
+
+	// set callback functions
+	glutKeyboardFunc(Key);
+	glutDisplayFunc(Draw);
+    glutIdleFunc(Draw);
+   
+   glewInit();
+    if (glewIsSupported("GL_VERSION_2_1"))
+        printf("Ready for OpenGL 2.1\n");
+    else 
+         printf("Warning: Detected that OpenGL 2.1 not supported\n");
+
+
+	wglSwapIntervalEXT(false);
+}
+
+// "Insert" a 0 bit after each of the 16 low bits of x
+int Part1By1(int x)
+{
+	x &= 0x0000ffff;                  // x = ---- ---- ---- ---- fedc ba98 7654 3210
+	x = (x ^ (x <<  8)) & 0x00ff00ff; // x = ---- ---- fedc ba98 ---- ---- 7654 3210
+	x = (x ^ (x <<  4)) & 0x0f0f0f0f; // x = ---- fedc ---- ba98 ---- 7654 ---- 3210
+	x = (x ^ (x <<  2)) & 0x33333333; // x = --fe --dc --ba --98 --76 --54 --32 --10
+	x = (x ^ (x <<  1)) & 0x55555555; // x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
+	
+	return x;
+}
+
+int EncodeMorton2(int x, int y)
+{
+	return (Part1By1(y) << 1) + Part1By1(x);
+}
+
+
+int main(int argc, char** argv)
+{
+	printf("N Body Benchmark CUDA\n\n");
+
+	//4^(n-1) 4^3
+	printf("%d\n", 64>>2);
+	// Initial body data
+	const int body_size = sizeof(body)*N;
+	const int DIM = 1 << n;
+
+	printf("Body List\n");
+	body* body_h = (body*)malloc( body_size );		
+	//int k = 0;
+	//double spacing_x = (sim_rad/4)/ DIM;
+	//double spacing_y = (sim_rad/4)/ DIM;
+/*
+	body_h[0].position.x = -7.5e17;
+	body_h[0].position.y = -7.5e17;
+	body_h[0].morton = 0;
+	body_h[1].position.x = -7.5e17;
+	body_h[1].position.y = -2.5e17;
+	body_h[1].morton = 1;
+	body_h[2].position.x = -7.5e17;
+	body_h[2].position.y = 2.5e17;
+	body_h[2].morton = 4;
+	body_h[3].position.x = -7.5e17;
+	body_h[3].position.y = 7.5e17;
+	body_h[3].morton = 5;
+
+	body_h[4].position.x = -2.5e17;
+	body_h[4].position.y = -7.5e17;
+	body_h[4].morton = 2;
+	body_h[5].position.x = -2.5e17;
+	body_h[5].position.y = -2.5e17;
+	body_h[5].morton = 3;
+	body_h[6].position.x = -2.5e17;
+	body_h[6].position.y = 2.5e17;
+	body_h[6].morton = 6;
+	body_h[7].position.x = -2.5e17;
+	body_h[7].position.y = 7.5e17;
+	body_h[7].morton = 7;
+
+	body_h[8].position.x = 2.5e17;
+	body_h[8].position.y = -7.5e17;
+	body_h[8].morton = 8;
+	body_h[9].position.x = 2.5e17;
+	body_h[9].position.y = -2.5e17;
+	body_h[9].morton = 9;
+	body_h[10].position.x = 2.5e17;
+	body_h[10].position.y = 2.5e17;
+	body_h[10].morton = 12;
+	body_h[11].position.x = 2.5e17;
+	body_h[11].position.y = 7.5e17;
+	body_h[11].morton = 13;
+
+	body_h[12].position.x = 7.5e17;
+	body_h[12].position.y = -7.5e17;
+	body_h[12].morton = 10;
+	body_h[13].position.x = 7.5e17;
+	body_h[13].position.y = -2.5e17;
+	body_h[13].morton = 11;
+	body_h[14].position.x = 7.5e17;
+	body_h[14].position.y = 2.5e17;
+	body_h[14].morton = 14;
+	body_h[15].position.x = 7.5e17;
+	body_h[15].position.y = 7.5e17;
+	body_h[15].morton = 15;
+
+
+	*/
+	for(int i = 0; i < N; i++)
+	{
+		body_h[i] = init_body(i);
+		//body_h[i].print();
+	}
+	printf("\n");
+
+	const int node_size = 1<<2*n;
+
+	printf("number of zones - %d\n", node_size);
+
+	// Lookup Table for morton codes
+	int* lut_h = (int*)malloc(sizeof(int)*DIM*DIM);
+	for(int y = 0; y < DIM; y++)
+	{
+		for(int x = 0; x < DIM; x++)
+		{
+			lut_h[y*DIM + x] = EncodeMorton2(x, y);
+			//printf("%d\t", lut_h[y*DIM + x]);
+		}
+		//printf("\n");
+	}
+
+	// allocate memory on device for buffers
+	cudaCheckAPIError( cudaMalloc( (void**)&b_in, body_size) );
+	cudaCheckAPIError( cudaMalloc( (void**)&b_out, body_size) );
+	cudaCheckAPIError( cudaMalloc( (void**)&LUT_d, sizeof(int)*node_size) );
+	cudaCheckAPIError( cudaMalloc( (void**)&M_cd, sizeof(double4)*node_size) );
+	cudaCheckAPIError( cudaMalloc( (void**)&index_d, sizeof(int2)*node_size) );
+
+	// copy data from host to device
+	cudaCheckAPIError( cudaMemcpy( b_in, body_h, body_size, cudaMemcpyHostToDevice) ); //same intial conditions
+	cudaCheckAPIError( cudaMemcpy( LUT_d, lut_h, sizeof(int)*DIM*DIM, cudaMemcpyHostToDevice) );
+		
+	//free host memory
+	free( body_h );
+	free( lut_h );
+
+	// Output some useful data
+	printf("Number of Bodies : \t%d\n", N);
+
+	printf("NBody\n");
+	printf("Global Work Size :\t%d\n", RoundUp(ThreadsX, N)/ThreadsX );
+	printf("Local Work Size :\t%d\n\n\n", ThreadsX);
+
+		initGL(argc, argv, 512, 512);
+        glutMainLoop();
+
+	return 0;
+}
+
+
+
+// query device properties
+void cudaQuery()
+{
+	// determine number of CUDA devices
+	int count;
+	cudaCheckAPIError( cudaGetDeviceCount(&count) );
+	printLine("Number of CUDA Devices ", count);
+	printBlank();
+
+	// output information on all devices
+	for(int i = 0; i < count; i++)
+	{
+		printLine("Device ", i+1);
+
+		// determine properties
+		cudaDeviceProp properties;
+		cudaCheckAPIError( cudaGetDeviceProperties(&properties, i) );
+
+		printLine("Name			", &properties.name);
+		printLine("Total Global Mem	", properties.totalGlobalMem);
+		printLine("Shared Mem Per Block	", properties.sharedMemPerBlock);
+		printLine("Regs Per Block		", properties.regsPerBlock);
+		printLine("Warp Size		", properties.warpSize);
+		printLine("MemPitch		", properties.memPitch);
+		printLine("Max Threads Per Block	", properties.maxThreadsPerBlock);
+		printLine("Max Threads Dim		", properties.maxThreadsDim);
+		printLine("Max Grid Size		", properties.maxGridSize);
+		printLine("Total Const Mem		", properties.totalConstMem);
+		printLine("Major			", properties.major);
+		printLine("Minor			", properties.minor);
+		printLine("Clock Rate		", properties.clockRate);
+		printLine("Texture Alignment	", properties.textureAlignment);
+		printLine("Device Overlap		", properties.deviceOverlap);
+		printLine("Multi Processor Count	", properties.multiProcessorCount);
+		printLine("Kernel Exec Timeout Enabled", properties.kernelExecTimeoutEnabled);
+		printLine("Integrated		", properties.integrated);
+		printLine("Can Map Host Memory	", properties.canMapHostMemory);
+		printLine("Compute Mode		", properties.computeMode);
+		printLine("Max Texture 1D		", properties.maxTexture1D);
+		printLine("Max Surface 2D		", properties.maxSurface2D);
+		printLine("Max Texture 2D		", properties.maxTexture2D);
+		printLine("Max Texture 3D		", properties.maxTexture3D);
+		printLine("Concurrent Kernels	", properties.concurrentKernels);
+	}
+	printBlank();
+}
+
+/*
+__device__ int quadWord(int* code, int n)
+{
+	int word = 0;
+	int mult = 1;
+	for(int i = n-1; i > -1; i--)
+	{
+		word += code[i]*mult;
+		mult *= 10;
+	}
+	return word;
+}
+
+__device__ int decToBase(int idx, int b)
+{
+    int r[n];
+    for(int i = 0; i < n; i++)
+    {
+        r[n-1-i]=idx%b;
+        idx /= b;
+    }
+
+	return quadWord(r, n);
+}
+*/
