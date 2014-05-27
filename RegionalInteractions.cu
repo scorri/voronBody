@@ -30,9 +30,9 @@ Body Interactions for region
 #include <GL/wglew.h>
 #include <GL/glut.h>
 
-const int N = 16;
-const int uNumVoronoiPts = 256; 
-int ThreadsX = 16;
+const int N = 2048;
+const int DIM = 1 << 4; // DIM = 2^n (n = 1, 2, 3..)
+int ThreadsX = 128;
 const int iterations = 100;
 const double sim_rad = 1e18;
 
@@ -63,7 +63,7 @@ int* LUT_d;
 int2* index_d;
 
 // Description of Body
-__host__ __device__ struct body
+struct body
 {
 	float4 colour;
 	double4 position;
@@ -125,13 +125,7 @@ __host__ __device__ struct body
 	}
 
 };
-/*
-// sort Morton
-__host__ __device__ bool operator<(const body &lhs, const body &rhs) 
-{
-	return lhs.morton < rhs.morton;
-}
-*/
+
 // sort Hilbert
 __host__ __device__ bool operator<(const body &lhs, const body &rhs) 
 {
@@ -294,13 +288,9 @@ __device__ double2 bodyBodyInteraction(double4 bi, double4 bj, double2 a, bool o
 	// [5 FLOPS]
 	double dist = sqrt(dx*dx + dy*dy) + 0.0000125; // additional softening parameter
 	
-	//if(output_thread)
-		//printf("dist - %g\n", dist);
-	
 	// [6 FLOPS]
 	double F = (G * bi.w * bj.w) / (dist*dist + EPS*EPS);
-	//if(output_thread)
-		//printf("F - %g\n", F);
+
 
 	// [6 FLOPS]
 	a.x += F * dx / dist;
@@ -396,76 +386,8 @@ compute_center_mass_with_search(body* body_in, double4* c_m, int2* index_store)
 	c_m[idx] = center;
 }
 
-// generates store of index locations for start and end of hilbert region
-// calculates center of mass for that region
-__global__ void
-compute_center_mass(body* body_in, double4* c_m, int2* index_store)
+__device__ double2 computeHilbertBodies(int h, int2* index_store, body* body_in, double4 position, double2 force)
 {
-    //	idx( 0 to uNumVoronoiPts )
-	unsigned int idx = blockIdx.x*blockDim.x + threadIdx.x;
-
-	bool mass = 0;
-	double4 center;
-	center.x = 0.0;
-	center.y = 0.0;
-	center.z = 0.0;
-	center.w = 0.0;
-
-	int first = 0;
-	int last = 0;
-
-	// for all bodies
-	for(int b = 0; b < N; b++)
-	{
-		int hil = body_in[b].hilbert;
-		if(idx == hil)
-		{
-			// if first hilbert in list
-			if(!mass)
-			{
-				center = body_in[b].position;	//assign initial value
-				first = b;
-				mass = true;
-			}
-			else
-			{
-				double4 other = body_in[b].position;
-				center.x = center.x*center.w + other.x * other.w;
-				center.y = center.y*center.w + other.y * other.w;
-				//center.z = center.z*center.w + other.z * other.w;
-				center.w += other.w;
-				center.x = center.x/center.w;
-				center.y = center.y/center.w;
-				//center.z = center.z/center.w;				
-			}
-		}
-		if(hil > idx)
-		{
-			first = (mass == 0) ? b : first;
-			//if((!mass))
-			//	first = b;
-	
-			last = b;
-			break;
-		}
-	}
-
-	last = ((last == 0) && (first != 0)) ? N-1 : last;
-	//if((last == 0) && (first != 0))
-	//	last = N-1;
-
-	//center of mass for voronoi region
-	index_store[idx].x = first;
-	index_store[idx].y = last;
-	c_m[idx] = center;
-}
-
-__device__ double2 computeHilbertBodies(int h, int2* index_store, body* body_in, double4 position)
-{
-	double2 force;
-	force.x = 0.0;
-	force.y = 0.0;
-
 	for(int i = index_store[h].x; i < index_store[h].y; i++)
 	{
 		force = bodyBodyInteraction(position, body_in[i].position, force, false);
@@ -474,31 +396,78 @@ __device__ double2 computeHilbertBodies(int h, int2* index_store, body* body_in,
 	return force;
 }
 
+__device__ int2 findValue(int* LUT, int h)
+{
+	for(int y = 0; y < DIM; y++)
+	{
+		for(int x = 0; x < DIM; x++)
+		{
+			if(LUT[y*DIM + x] == h)
+			{
+				int2 coords;
+				coords.x = x;
+				coords.y = y;
+				return coords;
+			}
+		}
+	}
+
+	int2 err;
+	err.x = -1;
+	err.y = -1;
+	return err;
+}
+
 __global__ void 
 nbody_kernel_hil(body* body_in, double4* c_m, int* LUT, int2* index_store, body* body_out)
 {
+	// body[idx]
     unsigned int idx = blockIdx.x*blockDim.x + threadIdx.x;
 
+	// Indentify the regions neighbouring body[idx]
+	int2 coords = findValue(LUT, body_in[idx].hilbert);
+	int regions[9];
+
+	// 9 reads from global memory.........
+	regions[0] = LUT[(coords.y-1 + DIM)%DIM*DIM + (coords.x-1 + DIM)%DIM];
+	regions[1] = LUT[(coords.y-1 + DIM)%DIM*DIM + (coords.x + DIM)%DIM];
+	regions[2] = LUT[(coords.y-1 + DIM)%DIM*DIM + (coords.x+1 + DIM)%DIM];
+		   
+	regions[3] = LUT[(coords.y + DIM)%DIM*DIM + (coords.x-1 + DIM)%DIM];
+	regions[4] = LUT[(coords.y + DIM)%DIM*DIM + (coords.x + DIM)%DIM];
+	regions[5] = LUT[(coords.y + DIM)%DIM*DIM + (coords.x+1 + DIM)%DIM];
+		   
+	regions[6] = LUT[(coords.y+1 + DIM)%DIM*DIM + (coords.x-1 + DIM)%DIM];
+	regions[7] = LUT[(coords.y+1 + DIM)%DIM*DIM + (coords.x + DIM)%DIM];
+	regions[8] = LUT[(coords.y+1 + DIM)%DIM*DIM + (coords.x+1 + DIM)%DIM];
+
+	// position of body[idx]
 	double4 position = body_in[idx].position;
-	int hilbert = body_in[idx].hilbert;
 
 	// calculate force contributions for body
 	double2 force;
 	force.x = 0.0;
 	force.y = 0.0;
 
-	// for bodies in same region do body body interaction
-	force = computeHilbertBodies(hilbert, index_store, body_in, position);
-
-	// else use the center of mass from LUT
-	// except the center of current hilbert
-	for(int i = 0; i < uNumVoronoiPts; i++)
+	// f is force of centerofmass relations with neighbouring regions
+	double2 f;
+	f.x = 0.0;
+	f.y = 0.0;
+	for(int i = 0; i < 9; i++)
 	{
-		if(i != hilbert)
-		{
-			double4 p_j = c_m[i];
-			force = bodyBodyInteraction(position, p_j, force, false);
-		}
+		force = computeHilbertBodies(regions[i], index_store, body_in, position, force); 
+		f = bodyBodyInteraction(position, c_m[regions[i]], f, false); 
+	}
+
+	// subtract the centerofmass influence to cancel when added to force
+	force.x = force.x - f.x;
+	force.y = force.y - f.y;
+
+	// perform center of mass interactions with all regions
+	for(int i = 0; i < DIM*DIM; i++)
+	{
+		double4 p_j = c_m[i];
+		force = bodyBodyInteraction(position, p_j, force, false);
 	}
 
 	// Do update
@@ -520,120 +489,6 @@ nbody_kernel_hil(body* body_in, double4* c_m, int* LUT, int2* index_store, body*
 	body_out[idx].morton = body_in[idx].morton;
 	body_out[idx].hilbert = body_in[idx].hilbert;
 
-}
-
-__global__ void 
-nbody_kernel_orig(body* body_in, double4* c_m, int* LUT, int2* index_store, body* body_out)
-{
-    unsigned int idx = blockIdx.x*blockDim.x + threadIdx.x;
-
-	double4 position = body_in[idx].position;
-	int hilbert = body_in[idx].hilbert;
-
-	// calculate force contributions for body
-	double2 force;
-	force.x = 0.0;
-	force.y = 0.0;
-
-	// for bodies in same region do body body interaction
-	for(int k = 0; k < N; k++)
-	{
-		int this_hil = body_in[k].hilbert;
-		if(hilbert == this_hil)
-		{
-			double4 p_j = body_in[k].position;
-
-			force = bodyBodyInteraction(position, p_j, force, false);
-		}
-		if(this_hil > hilbert)
-			break;
-	}
-
-	// else use the center of mass from LUT
-	// except the center of current hilbert
-	for(int i = 0; i < uNumVoronoiPts; i++)
-	{
-		if(i != hilbert)
-		{
-			double4 p_j = c_m[i];
-			force = bodyBodyInteraction(position, p_j, force, false);
-		}
-	}
-
-	// Do update
-	double4 velocity = body_in[idx].velocity;
-	double2 v;
-	v.x = velocity.x + 1e10 * force.x / position.w;
-	v.y = velocity.y + 1e10 * force.y / position.w;
-
-	body_out[idx].velocity.x = v.x;
-	body_out[idx].velocity.y = v.y;
-	body_out[idx].velocity.z = force.x;
-	body_out[idx].velocity.w = force.y;
-
-	body_out[idx].position.x = position.x + 1e10 * v.x;
-	body_out[idx].position.y = position.y + 1e10 * v.y;
-	body_out[idx].position.z = 0;
-	body_out[idx].position.w = position.w;
-	body_out[idx].colour = body_in[idx].colour;
-	body_out[idx].morton = body_in[idx].morton;
-	body_out[idx].hilbert = body_in[idx].hilbert;
-
-}
-
-__global__ void nbody_kernel(body* body_in, body* body_out)
-{
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if(idx >= N)
-		return;
-
-	extern __shared__ double4 shared_position[];
-
-	double4 position = body_in[idx].position;
-		
-	// calculate force contributions for body
-	double2 force;
-	force.x = 0.0;
-	force.y = 0.0;
-
-	for(int tile = 0; tile < gridDim.x; tile++)
-	{
-		unsigned int k = tile * blockDim.x + threadIdx.x;
-		shared_position[threadIdx.x] = body_in[k].position;
-
-		__syncthreads();
-
-
-//#pragma unroll 128
-		for(unsigned int counter = 0; counter < blockDim.x; counter++)
-		{
-			force = bodyBodyInteraction(position, shared_position[counter], force, false);
-		}
-
-		__syncthreads();
-	}
-	
-	// Do update
-	double4 velocity = body_in[idx].velocity;
-
-	double4 v;
-	v.x = velocity.x + 1e10 * force.x / position.w;
-	v.y = velocity.y + 1e10 * force.y / position.w;
-	v.z = force.x;
-	v.w = force.y;
-
-	double4 p;
-	p.x = position.x + 1e10 * v.x;
-	p.y = position.y + 1e10 * v.y;
-	p.z = 0;
-	p.w = position.w;
-
-	body_out[idx].velocity = v;
-	body_out[idx].position = p;
-	body_out[idx].colour = body_in[idx].colour;
-	body_out[idx].morton = body_in[idx].morton;
-	body_out[idx].hilbert = body_in[idx].hilbert;
 }
 
 // Create Voronoi kernel
@@ -654,7 +509,7 @@ __global__ void create_voronoi( body* body_in, body* body_out, VoronoiBuf * v)
 	double minDist = d;
 	int minDistPoint = 0;
 
-	for(int i = 0; i < uNumVoronoiPts; i++)
+	for(int i = 0; i < DIM*DIM; i++)
 	{
 		double diff_x = (v[i].x - x);
 		double diff_y = (v[i].y - y);
@@ -674,7 +529,6 @@ __global__ void create_voronoi( body* body_in, body* body_out, VoronoiBuf * v)
 	body_out[idx].position = body_in[idx].position;
 	body_out[idx].velocity = body_in[idx].velocity;
 }
-
 
 bool cudaCheckAPIError(cudaError_t err)
 {
@@ -779,7 +633,7 @@ void renderBodies(body* b)
     glEnable( GL_POINT_SMOOTH );
     glEnable( GL_BLEND );
     glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
-    glPointSize( 4.0 );
+    glPointSize( 2.0 );
 
 	glClearColor( 0.0, 0.0, 1.0, 1.0 );
 	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -790,7 +644,7 @@ void renderBodies(body* b)
 		for(int i = 0; i < N; i++)
 		{
 			glColor3f( bodies[i].colour.x, bodies[i].colour.y, bodies[i].colour.z );	
-			glVertex2f(bodies[i].position.x/(sim_rad/8), bodies[i].position.y/(sim_rad/8));
+			glVertex2f(bodies[i].position.x/(sim_rad/4), bodies[i].position.y/(sim_rad/4));
 		}
 	glEnd();
 
@@ -805,14 +659,14 @@ void renderBodies(body* b)
 
 void outputCOM()
 {
-	double4 com[uNumVoronoiPts];
-	int2 index_store[uNumVoronoiPts];
+	double4 com[DIM*DIM];
+	int2 index_store[DIM*DIM];
 
 	// copy data from device to host
-	cudaCheckAPIError( cudaMemcpy( com, M_cd, sizeof(double4)*uNumVoronoiPts, cudaMemcpyDeviceToHost ) );
-	cudaCheckAPIError( cudaMemcpy( index_store, index_d, sizeof(int2)*uNumVoronoiPts, cudaMemcpyDeviceToHost ) );
+	cudaCheckAPIError( cudaMemcpy( com, M_cd, sizeof(double4)*DIM*DIM, cudaMemcpyDeviceToHost ) );
+	cudaCheckAPIError( cudaMemcpy( index_store, index_d, sizeof(int2)*DIM*DIM, cudaMemcpyDeviceToHost ) );
 
-	for(int i = 0; i < uNumVoronoiPts; i++)
+	for(int i = 0; i < DIM*DIM; i++)
 	{
 		std::cout <<"H" << i << "\tX: " << com[i].x << " Y: " << com[i].y << " M: " << com[i].w << std::endl;
 		std::cout <<"\tFirst" << index_store[i].x << " Last: " << index_store[i].y << std::endl;
@@ -854,12 +708,8 @@ void computeCOM()
 	cudaCheckAPIError( cudaEventCreate(&startEvent) );
 	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
 
-	int gridSize = uNumVoronoiPts/ThreadsX;
-	if (gridSize < 1)
-		gridSize = 1;
-
-	dim3 grid( gridSize );
-	dim3 block( ThreadsX );
+	dim3 grid( 1 );
+	dim3 block( DIM*DIM );
 
 	cudaFuncSetCacheConfig(compute_center_mass_with_search, cudaFuncCachePreferL1);
 
@@ -872,56 +722,6 @@ void computeCOM()
 	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
 }
 
-
-void nBodySM()
-{
-	// Event parameters 
-	cudaEvent_t startEvent, stopEvent;
-
-	// Create the event using cudaEventCreate
-	cudaCheckAPIError( cudaEventCreate(&startEvent) );
-	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
-
-	dim3 grid(RoundUp(ThreadsX, N)/ThreadsX);
-	dim3 block(ThreadsX);
-
-	// compute body updates
-	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
-		nbody_kernel <<< grid, block, ThreadsX*sizeof(double4) >>> (b_out, b_in);
-	results.push_back( completeEvent(startEvent, stopEvent) );
-
-	// Release events
-	cudaCheckAPIError( cudaEventDestroy(startEvent) );
-	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
-}
-/*
-void nBodyOrig()
-{
-	// Event parameters 
-	cudaEvent_t startEvent, stopEvent;
-
-	// Create the event using cudaEventCreate
-	cudaCheckAPIError( cudaEventCreate(&startEvent) );
-	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
-
-	dim3 grid(RoundUp(ThreadsX, N)/ThreadsX);
-	dim3 block(ThreadsX);
-
-	//printf("%d %d\n", grid.x, block.x);
-	//system("pause");
-
-	cudaFuncSetCacheConfig(nbody_kernel_orig, cudaFuncCachePreferL1);
-
-	// compute body updates
-	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
-		nbody_kernel_orig <<< grid, block >>> (b_in, M_cd, LUT_d, index_d, b_out);
-	results.push_back( completeEvent(startEvent, stopEvent) );
-
-	// Release events
-	cudaCheckAPIError( cudaEventDestroy(startEvent) );
-	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
-}
-*/
 void nBodyHil()
 {
 	// Event parameters 
@@ -949,11 +749,11 @@ void nBodyHil()
 	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
 }
 
-void outputStats(std::vector<float>& results)
+float outputStats(std::vector<float>& results)
 {
 	// Median	
 	std::sort( results.begin(), results.end());
-	double med = 0.0;
+	float med = 0.0f;
 	if(results.size()/2 == 0)
 		med = results[ results.size()/2 ];
 	else
@@ -962,23 +762,11 @@ void outputStats(std::vector<float>& results)
 	}
 	printf("Median: %.2f ms\n", med);
 	//printf("\t %.2f Mop/s\n", computeStats(med));
-/*
-	// Mean
-	double sum = std::accumulate(std::begin(results), std::end(results), 0.0);
-	double m =  sum / results.size();
-	printf("Mean: %.2f ms\n", m);
-	//printf("\t %.2f Mop/s\n", computeStats(m));
-
-	// Standard deviation
-	double accum = 0.0;
-	std::for_each (std::begin(results), std::end(results), [&](const double d) {
-		accum += (d - m) * (d - m);
-	});
-	double stdev = sqrt(accum / (results.size()-1));
-	printf("Standard Deviation: %.2f\n", stdev);*/
 
 	//printf("1. %.2f %d. %.2f\n", results[0], results.size()-1, results[results.size()-1]);
 	results.clear();
+
+	return med;
 }
 
 void sortBodies()
@@ -1046,136 +834,43 @@ void sortBodies()
 */
 }
 
-void sortRender(body* b_draw)
-{
-	body bodies[N];
-	thrust::device_vector<body> b;
-	thrust::host_vector<body> output;
-
-	// read from device memory to host buffer
-	cudaCheckAPIError( cudaMemcpy( bodies, b_draw, sizeof(body)*N, cudaMemcpyDeviceToHost ) );
-
-	// set up drawing
-    glEnable( GL_POINT_SMOOTH );
-    glEnable( GL_BLEND );
-    glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
-    glPointSize( 9.0 );
-
-	glClearColor( 0.0, 0.0, 1.0, 1.0 );
-	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-	// for all points - draw and copy into host vector
-	glBegin(GL_POINTS);
-		for(int i = 0; i < N; i++)
-		{
-			glColor3f( bodies[i].colour.x, bodies[i].colour.y, bodies[i].colour.z );	
-			glVertex2f(bodies[i].position.x/(sim_rad/8), bodies[i].position.y/(sim_rad/8));
-			output.push_back(bodies[i]);
-		}
-	glEnd();
-
-	// finish drawing
-	glFinish();
-	glutSwapBuffers();
-
-	// Event parameters 
-	cudaEvent_t startEvent, stopEvent;
-
-	// Create the event using cudaEventCreate
-	cudaCheckAPIError( cudaEventCreate(&startEvent) );
-	cudaCheckAPIError( cudaEventCreate(&stopEvent) );
-
-	// copy from host to device vector
-	b = output;
-
-	// sort using thrust on morton code
-	cudaCheckAPIError( cudaEventRecord(startEvent, 0) );
-		thrust::sort(b.begin(), b.end());
-	sresults.push_back( completeEvent(startEvent, stopEvent) );
-
-	// Release events
-	cudaCheckAPIError( cudaEventDestroy(startEvent) );
-	cudaCheckAPIError( cudaEventDestroy(stopEvent) );
-
-	// copy device to host vector
-	output = b;
-	
-	// copy host vector to host memory
-	for(int i= 0; i < N; i++)
-	{
-		bodies[i] = output[i];
-		bodies[i].print();
-	}
-	printf("\n");
-
-	//system("pause");
-	// copy host memory to device memory
-	cudaCheckAPIError( cudaMemcpy( b_in, bodies, sizeof(body)*N, cudaMemcpyHostToDevice) );
-}
-
-void outputBodies(body* b)
-{
-	body bodies[N];
-
-	// copy data from device to host
-	cudaCheckAPIError( cudaMemcpy( bodies, b, sizeof(body)*N, cudaMemcpyDeviceToHost ) );
-
-	for(int i = 0; i < N; i++)
-	{
-		//output.push_back(bodies[i]);
-		bodies[i].print();
-	}
-
-}
-
 void Draw()
 {	
-	//printf("voronoi encoding..\n");
 	executeVoronoi();
-	//outputBodies(b_out);
-	//system("pause");
 
-	//printf("sorting..\n");
 	sortBodies();	
-	//outputBodies(b_in);
-	//system("pause");
-
-	//sortRender(b_in); // reduce memory transfers by 1
 
 	// compute center of mass requires sorted order
-	//printf("computing com..\n");
 	computeCOM();
 	//outputCOM();
-	//system("pause");
 
-	//printf("performing interactions..\n");
+	//nBodySM();
+	//nBodyOrig();
 	nBodyHil();
-	//outputBodies(b_out);
-	//system("pause");
 
-	//printf("drawing bodies..\n");
 	renderBodies(b_out);
 
 	std::swap(b_in, b_out);
-/*
+
 	static int i = 0;
 	i++;
 	if(i > iterations)
 	{
 		i = 0;
 		
+		float total_time = 0.0f;
 		// Output Interaction Results
 		printf("\nVoronoi NBody Results\n");
 		printf("Threads -\t%d\n", ThreadsX);
 		printf("Voronoi -\t");
-		outputStats(vresults);
+		total_time += outputStats(vresults);
 		printf("Sort -\t");
-		outputStats(sresults);
+		total_time += outputStats(sresults);
 		printf("CoM -\t");
-		outputStats(cresults);
+		total_time += outputStats(cresults);
 		printf("NBody -\t");
-		outputStats(results);
-
+		total_time += outputStats(results);
+		printf("Total Time for simulation - %.2f\n", total_time);
 		ThreadsX *= 2;
 
 	//	system("pause");
@@ -1186,7 +881,7 @@ void Draw()
 		system("pause");
 		cleanup();
 	}
-*/
+
 }
 
 void initGL(int argc, char *argv[], int wWidth, int wHeight)
@@ -1212,7 +907,7 @@ void initGL(int argc, char *argv[], int wWidth, int wHeight)
 
 	wglSwapIntervalEXT(false);
 }
-
+/*
 int2 findValue(int** LUT, int h)
 {
 	int n = 4;
@@ -1222,6 +917,30 @@ int2 findValue(int** LUT, int h)
 		for(int x = 0; x < n; x++)
 		{
 			if(LUT[x][y] == h)
+			{
+				int2 coords;
+				coords.x = x;
+				coords.y = y;
+				return coords;
+			}
+		}
+	}
+
+	int2 err;
+	err.x = -1;
+	err.y = -1;
+	return err;
+}
+
+int2 findValue(int* LUT, int h)
+{
+	int n = 4;
+
+	for(int y = 0; y < n; y++)
+	{
+		for(int x = 0; x < n; x++)
+		{
+			if(LUT[y*n + x] == h)
 			{
 				int2 coords;
 				coords.x = x;
@@ -1252,13 +971,36 @@ void outputSearchZone(int** LUT, int zone)
 	std::cout << LUT[(idx.x-1 + n)%n][(idx.y+1 + n)%n] << " " << LUT[(idx.x + n)%n][(idx.y+1 + n)%n] << " "<< LUT[(idx.x+1 + n)%n][(idx.y+1 + n)%n] << std::endl;
 }
 
+void outputSearchZone(int* LUT, int zone)
+{
+	int n = 4;
+	//find index of LUT for Hilbert zone subject of search
+	int2 coords = findValue(LUT, zone);
+
+	std::cout << "\nSearch zone " << zone << " is at index - " << coords.x << ", "<< coords.y << std::endl;
+	//std::cout << (idx - n - 1 + uNumVoronoiPts)%uNumVoronoiPts << " " << (idx - n + uNumVoronoiPts)%uNumVoronoiPts << " "<< (idx - n + 1 + uNumVoronoiPts)%uNumVoronoiPts << std::endl;
+	//std::cout << (idx - 1 + uNumVoronoiPts)%uNumVoronoiPts << " " << idx << " "<< (idx + 1 + uNumVoronoiPts)%uNumVoronoiPts << std::endl;
+	//std::cout << (idx + n - 1 + uNumVoronoiPts)%uNumVoronoiPts << " " << (idx + n + uNumVoronoiPts)%uNumVoronoiPts << " "<< (idx + n + 1 + uNumVoronoiPts)%uNumVoronoiPts << std::endl;
+	std::cout << LUT[(coords.y-1 + n)%n*n + (coords.x-1 + n)%n] 
+	<< " " << LUT[(coords.y-1 + n)%n*n + (coords.x + n)%n]<< " "
+		<< LUT[(coords.y-1 + n)%n*n + (coords.x+1 + n)%n] << std::endl;
+	
+	std::cout << LUT[(coords.y + n)%n*n + (coords.x-1 + n)%n] << " " 
+		<< LUT[(coords.y + n)%n*n + (coords.x + n)%n] << " "
+		<< LUT[(coords.y + n)%n*n + (coords.x+1 + n)%n]<< std::endl;
+	
+	std::cout << LUT[(coords.y+1 + n)%n*n + (coords.x-1 + n)%n] << " " 
+		<< LUT[(coords.y+1 + n)%n*n + (coords.x + n)%n] << " "
+		<< LUT[(coords.y+1 + n)%n*n + (coords.x+1 + n)%n]<< std::endl;
+}
+*/
 int main(int argc, char** argv)
 {
 	printf("N Body Benchmark CUDA\n\n");
 
 	// Initial body data
 	const int body_size = sizeof(body)*N;
-	const int voronoi_size = sizeof(VoronoiBuf)*uNumVoronoiPts;
+	const int voronoi_size = sizeof(VoronoiBuf)*DIM*DIM;
 
 	printf("Body List\n");
 	body* body_h = (body*)malloc( body_size );
@@ -1268,24 +1010,26 @@ int main(int argc, char** argv)
 		//body_h[i].print();
 	}
 	printf("\n");
-	int dim = sqrt((float)uNumVoronoiPts);
+
 	// Generate Voronoi Points	
 	VoronoiBuf* Voronoi_h = (VoronoiBuf*)malloc(voronoi_size);
-	int** LUT_h = (int**)malloc(sizeof(int*)*dim);
-	for(int i = 0; i < dim; i++)
-		LUT_h[i] = (int*)malloc(sizeof(int)*dim);
+	int** LUT_h = (int**)malloc(sizeof(int*)*DIM);
+	for(int i = 0; i < DIM; i++)
+		LUT_h[i] = (int*)malloc(sizeof(int)*DIM);
+	int* lut_h = (int*)malloc(sizeof(int)*DIM*DIM);
 
 	printf("Program Data\n");
-	printf("Number of Voronoi Points :\t%d\n", uNumVoronoiPts);
+	printf("Number of Voronoi Points :\t%d\n", DIM*DIM);
 	int k = 0;
-
-	double spacing_x = (sim_rad/4)/ dim;
-	double spacing_y = (sim_rad/4)/ dim;
-	printf("%d %g %g\n\n", dim, spacing_x, spacing_y); 
+	
+	double radius = sim_rad/8;
+	double spacing_x = (2*radius)/ DIM;
+	double spacing_y = (2*radius)/ DIM;
+	printf("%d %g %g\n\n", DIM, spacing_x, spacing_y); 
 	printf("Voronoi Points\n");
-	for(int y = -1*dim/2; y < dim/2; y++)
+	for(int y = -1*DIM/2; y < DIM/2; y++)
 	{
-		for(int x = -1*dim/2; x < dim/2; x++)
+		for(int x = -1*DIM/2; x < DIM/2; x++)
 		{
 			Voronoi_h[k].x = spacing_x/2 + spacing_x*y;
 			Voronoi_h[k].y = spacing_y/2 + spacing_y*x;
@@ -1293,42 +1037,70 @@ int main(int argc, char** argv)
 			Voronoi_h[k].colour.y = (sin(2.4*k + 2) *127 + 128)/255;
 			Voronoi_h[k].colour.z = (sin(2.4*k + 4) *127 + 128)/255;
 			Voronoi_h[k].colour.w = 1.0f;
-			Voronoi_h[k].morton = EncodeMorton2(x + dim/2, y + dim/2);
-			Voronoi_h[k].hilbert = EncodeHilbert2(uNumVoronoiPts, x + dim/2, y + dim/2);
+			Voronoi_h[k].morton = EncodeMorton2(x + DIM/2, y + DIM/2);
+			Voronoi_h[k].hilbert = EncodeHilbert2(DIM*DIM, x + DIM/2, y + DIM/2);
 			//Voronoi_h[k].print();
-			LUT_h[x+dim/2][y+dim/2] = Voronoi_h[k].hilbert;
-			//printf("%d - %d\t", k, LUT_h[x+dim/2][y+dim/2]);
+			LUT_h[x+DIM/2][y+DIM/2] = Voronoi_h[k].hilbert;
+			lut_h[k] = Voronoi_h[k].hilbert;
+			//printf("%d - %d\t", k, LUT_h[x+DIM/2][y+DIM/2]);
 			k++;
 		}
 		//std::cout << std::endl;
 	}
-
-	//for(int i = 0; i < uNumVoronoiPts; i++)
-	//{
-	//	outputSearchZone(LUT_h, i);
-	//	std::cout<<std::endl;
-	//}
-
+	/*
+	double spacing_x = (sim_rad/4)/ DIM;
+	double spacing_y = (sim_rad/4)/ DIM;
+	printf("%d %g %g\n\n", DIM, spacing_x, spacing_y); 
+	printf("Voronoi Points\n");
+	for(int y = -1*DIM/2; y < DIM/2; y++)
+	{
+		for(int x = -1*DIM/2; x < DIM/2; x++)
+		{
+			Voronoi_h[k].x = spacing_x/2 + spacing_x*y;
+			Voronoi_h[k].y = spacing_y/2 + spacing_y*x;
+			Voronoi_h[k].colour.x = (sin(2.4*k + 0) *127 + 128)/255;
+			Voronoi_h[k].colour.y = (sin(2.4*k + 2) *127 + 128)/255;
+			Voronoi_h[k].colour.z = (sin(2.4*k + 4) *127 + 128)/255;
+			Voronoi_h[k].colour.w = 1.0f;
+			Voronoi_h[k].morton = EncodeMorton2(x + DIM/2, y + DIM/2);
+			Voronoi_h[k].hilbert = EncodeHilbert2(DIM*DIM, x + DIM/2, y + DIM/2);
+			Voronoi_h[k].print();
+			LUT_h[x+DIM/2][y+DIM/2] = Voronoi_h[k].hilbert;
+			lut_h[k] = Voronoi_h[k].hilbert;
+			printf("%d - %d\t", k, LUT_h[x+DIM/2][y+DIM/2]);
+			k++;
+		}
+		std::cout << std::endl;
+	}*/
+	/*
+	for(int i = 0; i < uNumVoronoiPts; i++)
+	{
+		outputSearchZone(LUT_h, i);
+		std::cout<<std::endl;
+		outputSearchZone(lut_h, i);
+	}
+	*/
 
 	// allocate memory on device for buffers
 	cudaCheckAPIError( cudaMalloc( (void**)&b_in, body_size) );
 	cudaCheckAPIError( cudaMalloc( (void**)&b_out, body_size) );
 	cudaCheckAPIError( cudaMalloc( (void**)&Voronoi_d, voronoi_size) );
-	cudaCheckAPIError( cudaMalloc( (void**)&LUT_d, sizeof(int)*uNumVoronoiPts) );
-	cudaCheckAPIError( cudaMalloc( (void**)&M_cd, sizeof(double4)*uNumVoronoiPts) );
-	cudaCheckAPIError( cudaMalloc( (void**)&index_d, sizeof(int2)*uNumVoronoiPts) );
+	cudaCheckAPIError( cudaMalloc( (void**)&LUT_d, sizeof(int)*DIM*DIM) );
+	cudaCheckAPIError( cudaMalloc( (void**)&M_cd, sizeof(double4)*DIM*DIM) );
+	cudaCheckAPIError( cudaMalloc( (void**)&index_d, sizeof(int2)*DIM*DIM) );
 
 	// copy data from host to device
 	cudaCheckAPIError( cudaMemcpy( b_in, body_h, body_size, cudaMemcpyHostToDevice) ); //same intial conditions
 	cudaCheckAPIError( cudaMemcpy( Voronoi_d, Voronoi_h, voronoi_size, cudaMemcpyHostToDevice) );
-	cudaCheckAPIError( cudaMemcpy( LUT_d, LUT_h, sizeof(int)*uNumVoronoiPts, cudaMemcpyHostToDevice) );
+	cudaCheckAPIError( cudaMemcpy( LUT_d, lut_h, sizeof(int)*DIM*DIM, cudaMemcpyHostToDevice) );
 	
 	//free host memory
 	free( Voronoi_h );
 	free( body_h );
-	for(int i = 0; i < dim; i++)
+	for(int i = 0; i < DIM; i++)
 		free(LUT_h[i]);
 	free( LUT_h );
+	free( lut_h );
 	
 	// Output some useful data
 	printf("Number of Bodies : \t%d\n", N);
