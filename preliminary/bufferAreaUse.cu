@@ -120,7 +120,7 @@ __device__ __host__ int Part1By1(int x)
 	x = (x ^ (x <<  4)) & 0x0f0f0f0f; // x = ---- fedc ---- ba98 ---- 7654 ---- 3210
 	x = (x ^ (x <<  2)) & 0x33333333; // x = --fe --dc --ba --98 --76 --54 --32 --10
 	x = (x ^ (x <<  1)) & 0x55555555; // x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
-	
+
 	return x;
 }
 
@@ -174,16 +174,16 @@ buffer_area_kernel(body* body_draw, int* LUT)
 	int DIM = 1 << n;
 
 	int2 coords = findValue(LUT, idx);
-	
+
 	int regions[9];
 	regions[0] = LUT[ (coords.y) * (DIM+2) + coords.x     ];
 	regions[1] = LUT[ (coords.y) * (DIM+2) + coords.x + 1 ];
 	regions[2] = LUT[ (coords.y) * (DIM+2) + coords.x + 2 ];
-	
+
 	regions[3] = LUT[ (coords.y + 1) * (DIM+2) + coords.x     ];
 	regions[4] = LUT[ (coords.y + 1) * (DIM+2) + coords.x + 1 ];
 	regions[5] = LUT[ (coords.y + 1) * (DIM+2) + coords.x + 2 ];
-	
+
 	regions[6] = LUT[ (coords.y + 2) * (DIM+2) + coords.x     ];
 	regions[7] = LUT[ (coords.y + 2) * (DIM+2) + coords.x + 1 ];
 	regions[8] = LUT[ (coords.y + 2) * (DIM+2) + coords.x + 2 ];
@@ -399,10 +399,10 @@ float completeEvent(cudaEvent_t start, cudaEvent_t stop)
 {
 	// Add the stop event to the GPUs queue of work
 	cudaCheckAPIError( cudaEventRecord(stop, 0) );
-	
+
 	// Wait until the event has completed so it is safe to read
 	cudaCheckAPIError( cudaEventSynchronize(stop) );
-	
+
 	// Determine the time elapsed between the events
 	float milliseconds = 0;
 	cudaCheckAPIError( cudaEventElapsedTime(&milliseconds, start, stop) );
@@ -422,7 +422,7 @@ void renderBodies()
     glEnable( GL_BLEND );
     glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
     glPointSize( 6.0 );
-	
+
 	glClearColor( 0.0, 0.0, 1.0, 1.0 );
 	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -573,7 +573,7 @@ void Coding(const char* title, int* padded)
 
 	// copy to device
 	cudaCheckAPIError( cudaMemcpy( LUT_d, padded, sizeof(int)*(DIM+2)*(DIM+2), cudaMemcpyHostToDevice) );
-	
+
 	// run Kernel
 	bufferAreaKernel();
 
@@ -751,14 +751,14 @@ int main(int argc, char** argv)
 		//printf("\n");
 	}
 	printf("\n%d display bodies created\n", k);
-	
+
 	// allocate memory on device for buffers
 	cudaCheckAPIError( cudaMalloc( (void**)&LUT_d, sizeof(int)*(DIM+2)*(DIM+2)) );
 	cudaCheckAPIError( cudaMalloc( (void**)&b_draw,  sizeof(body)*(1 << 4*n) ) );
 
 	// copy data from host to device
 	cudaCheckAPIError( cudaMemcpy( b_draw, bodies, sizeof(body)*(1 << 4*n), cudaMemcpyHostToDevice) ); //same intial conditions
-	
+
 		initGL(argc, argv, 512, 512);
         glutMainLoop();
 
