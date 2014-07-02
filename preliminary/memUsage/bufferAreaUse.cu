@@ -12,6 +12,15 @@ shows which regions other regions use in interactions
    .
    .
 
+
+h - hilbert coding
+m - morton coding
+r - row major coding
+t - test
++ - increase out
+- - decrease out
+
+
 Morton Coding
 http://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
 */
@@ -35,9 +44,12 @@ http://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
 #ifdef _WIN32
 #include<windows.h>
 #endif
-#include <GL/glew.h>
-#include <GL/wglew.h>
-#include <GL/glut.h>
+//#include <GL/glew.h>
+//#include <GL/wglew.h>
+//#include <GL/glut.h>
+
+#include "GL/freeglut.h"
+#include "GL/gl.h"
 
 const int n = 2;
 const int N = 1<<2*n;
@@ -319,25 +331,6 @@ bool cudaCheckAPIError(cudaError_t err)
 	return true;
 }
 
-template <class T>
-void printLine(const char* message, T value)
-{
-	std::cout << message << "\t : " << value << std::endl;
-}
-template <class T>
-void printLine(const char* message, T* value)
-{
-	if(value[2] == NULL)
-		std::cout << message << "\t : " << value[0] << ", " << value[1] << std::endl;
-	else
-		std::cout << message << "\t : " << value[0] << " " << value[1] << " " << value[2] << std::endl;
-}
-
-void printBlank()
-{
-	std::cout << std::endl;
-}
-
 size_t RoundUp(int groupSize, int globalSize)
 {
     int r = globalSize % groupSize;
@@ -509,15 +502,15 @@ void initGL(int argc, char *argv[], int wWidth, int wHeight)
 {
 	// init gl
 	glutInit( &argc, argv );
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
-    glutInitWindowPosition(500, 100);
+    	glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    	glutInitWindowPosition(500, 100);
 	glutInitWindowSize( wWidth, wHeight );
 
 	// create window1
 	glutCreateWindow( "Buffer Area Usage" );
 	glutKeyboardFunc(Key);
 	glutDisplayFunc(Draw);
-    glutIdleFunc(Draw);
+    	glutIdleFunc(Draw);
   /*
 	// create another window
 	glutInitWindowPosition(510+wWidth, 100);
@@ -525,14 +518,14 @@ void initGL(int argc, char *argv[], int wWidth, int wHeight)
 	glutDisplayFunc(Draw1);
     glutIdleFunc(Draw1);
 */
-   glewInit();
-    if (glewIsSupported("GL_VERSION_2_1"))
-        printf("Ready for OpenGL 2.1\n");
-    else 
-         printf("Warning: Detected that OpenGL 2.1 not supported\n");
+  // glewInit();
+    //if (glewIsSupported("GL_VERSION_2_1"))
+      //  printf("Ready for OpenGL 2.1\n");
+    //else 
+      //   printf("Warning: Detected that OpenGL 2.1 not supported\n");
 
 
-	wglSwapIntervalEXT(false);
+	//wglSwapIntervalEXT(false);
 }
 
 //rotate/flip a quadrant appropriately
@@ -759,7 +752,8 @@ int main(int argc, char** argv)
 	// copy data from host to device
 	cudaCheckAPIError( cudaMemcpy( b_draw, bodies, sizeof(body)*(1 << 4*n), cudaMemcpyHostToDevice) ); //same intial conditions
 
-		initGL(argc, argv, 512, 512);
+	
+	initGL(argc, argv, 512, 512);
         glutMainLoop();
 
 	return 0;
